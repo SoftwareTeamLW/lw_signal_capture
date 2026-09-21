@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/ui">
+    <file alias="check_mark.png">check_mark.png</file>
+    <file alias="company_logo.png">company_logo.png</file>
+  </qresource>
+</RCC>

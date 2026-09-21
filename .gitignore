@@ -1,0 +1,57 @@
+# ==============================
+# Build / CMake
+# ==============================
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ==============================
+# Qt Creator
+# ==============================
+.qtcreator/
+*.user
+*.user.*
+CMakeLists.txt.user*
+
+# ==============================
+# Compiled files
+# ==============================
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# ==============================
+# IQ capture data
+# ==============================
+*.bin
+*.iq
+*.dat
+
+# ==============================
+# Runtime logs
+# ==============================
+log/
+logs/
+*.log
+
+# ==============================
+# IDE
+# ==============================
+.vscode/
+.idea/
+
+# ==============================
+# Temporary files
+# ==============================
+*.tmp
+*.swp
+*~
+.DS_Store
