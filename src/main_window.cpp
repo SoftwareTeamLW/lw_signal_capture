@@ -2,6 +2,7 @@
 
 #include "plot_widgets.hpp"
 #include "rx_worker.hpp"
+#include "data_validator.hpp"
 #include "ui_main_window.h"
 
 
@@ -101,11 +102,13 @@ QString selectedChannelsText(const std::array<bool, 8>& enabled)
 constexpr quint64 kMiB = 1024ULL * 1024ULL;
 constexpr quint64 kGiB = 1024ULL * 1024ULL * 1024ULL;
 constexpr quint64 kMinIqBufferBytes = 256ULL * kMiB;
-constexpr quint64 kMaxIqBufferBytes = 16ULL * kGiB;
+constexpr quint64 kMaxIqBufferBytes = 4ULL * kGiB;
+constexpr quint64 kAutoIqBufferMaxBytes = 2ULL * kGiB;
+constexpr quint64 kIqBufferAlignmentBytes = 256ULL * 1024ULL;
 constexpr double kIqBufferSafeFraction = 0.25;
 constexpr double kIqBufferReserveFraction = 0.15;
 constexpr quint64 kIqBufferReserveFloorBytes = 2ULL * kGiB;
-constexpr double kIqBufferAutoTargetSeconds = 2.0;
+constexpr double kIqBufferAutoTargetSeconds = 0.75;
 constexpr double kPcieContinuousSafetyFraction = 0.85;
 
 struct HostMemoryBudget
@@ -196,24 +199,30 @@ quint64 expectedIqBytesPerSecond(const RxConfig& cfg)
         * 4ULL;
 }
 
+quint64 requestedIqBufferBytesForSeconds(quint64 expectedBytesPerSecond, double seconds)
+{
+    if (expectedBytesPerSecond == 0 || seconds <= 0.0) return 0;
+    const long double target = static_cast<long double>(expectedBytesPerSecond) * seconds;
+    if (target >= static_cast<long double>(std::numeric_limits<quint64>::max()))
+        return std::numeric_limits<quint64>::max();
+    quint64 bytes = static_cast<quint64>(target);
+    bytes = std::max(bytes, kMinIqBufferBytes);
+    const quint64 remainder = bytes % kIqBufferAlignmentBytes;
+    if (remainder != 0 && bytes <= std::numeric_limits<quint64>::max() - (kIqBufferAlignmentBytes - remainder))
+        bytes += kIqBufferAlignmentBytes - remainder;
+    return bytes;
+}
+
 quint64 chooseAutoIqBufferBytes(quint64 expectedBytesPerSecond, quint64 safeLimit)
 {
-    static constexpr std::array<quint64, 8> kTiers = {
-        256ULL * kMiB, 512ULL * kMiB, 1ULL * kGiB,
-        2ULL * kGiB, 4ULL * kGiB, 8ULL * kGiB,
-        12ULL * kGiB, 16ULL * kGiB
-    };
     if (safeLimit < kMinIqBufferBytes) return 0;
-
-    const long double target = static_cast<long double>(expectedBytesPerSecond)
-        * kIqBufferAutoTargetSeconds;
-    quint64 largestSafe = 0;
-    for (quint64 tier : kTiers) {
-        if (tier > safeLimit) break;
-        largestSafe = tier;
-        if (static_cast<long double>(tier) >= target) return tier;
-    }
-    return largestSafe;
+    const quint64 limit = std::min(safeLimit, kAutoIqBufferMaxBytes);
+    if (limit < kMinIqBufferBytes) return 0;
+    const quint64 requested = requestedIqBufferBytesForSeconds(
+        expectedBytesPerSecond, kIqBufferAutoTargetSeconds);
+    quint64 bytes = std::min(requested, limit);
+    bytes = (bytes / kIqBufferAlignmentBytes) * kIqBufferAlignmentBytes;
+    return std::max(kMinIqBufferBytes, bytes);
 }
 
 struct PcieLinkBudget
@@ -286,13 +295,6 @@ PcieLinkBudget detectLwPcieBudget()
     return best;
 }
 
-QString logDirectoryForIqPath(const QString& iqPath)
-{
-    const QString normalized = iqPath.trimmed().isEmpty()
-        ? QStringLiteral("rx_iq.bin") : iqPath.trimmed();
-    const QFileInfo info(normalized);
-    return QDir(info.absolutePath()).filePath(QStringLiteral("log"));
-}
 }
 
 MainWindow::MainWindow(QWidget* parent)
@@ -311,7 +313,6 @@ MainWindow::MainWindow(QWidget* parent)
     }
 
     qRegisterMetaType<DisplayFrame>("DisplayFrame");
-    initializeSessionLog(ui->filePathEdit->text().trimmed());
 
     setupAdaptiveContainers();
     polishUi();
@@ -325,12 +326,9 @@ MainWindow::MainWindow(QWidget* parent)
     retranslateDynamicUi();
     QTimer::singleShot(0, this, &MainWindow::updateResponsiveLayout);
 
-    appendLog(tr("[系统] 就绪 · V4.0"));
+    appendLog(tr("[系统] 就绪 · V1.1.1"));
     appendLog(tr("[系统] 设备接口：PCIe / pcie_0"));
-    if (!sessionLogPath_.isEmpty())
-        appendLog(tr("[系统] 运行日志：%1").arg(sessionLogPath_));
-    else
-        appendLog(tr("[警告] 运行日志文件创建失败；本次仅保留界面日志"));
+    appendLog(tr("[系统] 日志模式：普通（开发者模式可保存完整诊断日志）"));
     appendDeveloperLog(tr("[APP] Qt=%1 | OS=%2 | CPU=%3 | build=%4 %5")
         .arg(QString::fromLatin1(qVersion()))
         .arg(QSysInfo::prettyProductName())
@@ -452,14 +450,13 @@ void MainWindow::polishUi()
     }
     ui->channelModeComboBox->view()->setMinimumWidth(330);
 
-    // IQ buffer choices use exact byte values as item data. Index 0 is Auto.
-    const std::array<quint64, 9> iqBufferValues = {
-        0ULL, 256ULL * kMiB, 512ULL * kMiB, 1ULL * kGiB,
-        2ULL * kGiB, 4ULL * kGiB, 8ULL * kGiB,
-        12ULL * kGiB, 16ULL * kGiB
-    };
-    for (int i = 0; i < ui->iqBufferComboBox->count() && i < static_cast<int>(iqBufferValues.size()); ++i)
-        ui->iqBufferComboBox->setItemData(i, QVariant::fromValue<qulonglong>(iqBufferValues[static_cast<std::size_t>(i)]));
+    // IQ buffer choices are expressed as time windows. Item data stores
+    // milliseconds; MainWindow converts them to bytes for the current data rate.
+    const std::array<int, 5> iqBufferMilliseconds = {0, 250, 500, 1000, 2000};
+    for (int i = 0; i < ui->iqBufferComboBox->count() && i < static_cast<int>(iqBufferMilliseconds.size()); ++i)
+        ui->iqBufferComboBox->setItemData(i, iqBufferMilliseconds[static_cast<std::size_t>(i)]);
+    for (int i = 0; i < ui->storageModeComboBox->count(); ++i)
+        ui->storageModeComboBox->setItemData(i, i);
 
     ui->averageButton->setToolTip(tr("Base Trace 的指数平均模式；平均强度由“平均 α”调节"));
     ui->averageAlphaSpinBox->setToolTip(tr("指数平均系数 α：越小越平滑、响应越慢；越大越接近实时。1.00 等效为不平均。"));
@@ -872,8 +869,12 @@ void MainWindow::wireUi()
             this, &MainWindow::disconnectDevice);
 
     connect(ui->browseButton, &QPushButton::clicked, this, [this] {
+        const QString current = ui->filePathEdit->text().trimmed();
+        const QString suggested = QFileInfo(current).isRelative()
+            ? QDir(QCoreApplication::applicationDirPath()).filePath(current)
+            : current;
         const QString path = QFileDialog::getSaveFileName(
-            this, tr("保存 IQ 数据"), ui->filePathEdit->text(),
+            this, tr("保存 IQ 数据"), suggested,
             tr("Binary IQ (*.bin);;All files (*)"));
         if (!path.isEmpty()) ui->filePathEdit->setText(path);
     });
@@ -887,6 +888,10 @@ void MainWindow::wireUi()
             this, &MainWindow::startCapture);
     connect(ui->stopButton, &QPushButton::clicked,
             this, &MainWindow::stopCapture);
+    connect(ui->validateDataButton, &QPushButton::clicked,
+            this, &MainWindow::startDataValidation);
+    connect(ui->logModeComboBox, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int index) { setDeveloperMode(index == 1); });
 }
 
 void MainWindow::updateChannelModes()
@@ -960,31 +965,6 @@ void MainWindow::refreshIqBufferOptions()
     const HostMemoryBudget budget = detectHostMemoryBudget();
     const quint64 safeLimit = budget.safeIqBufferLimit;
 
-    auto* model = qobject_cast<QStandardItemModel*>(ui->iqBufferComboBox->model());
-    if (model) {
-        for (int i = 0; i < ui->iqBufferComboBox->count(); ++i) {
-            QStandardItem* item = model->item(i);
-            if (!item) continue;
-            const quint64 bytes = ui->iqBufferComboBox->itemData(i).toULongLong();
-            const bool autoItem = (i == 0 || bytes == 0);
-            const bool allowed = autoItem ? safeLimit >= kMinIqBufferBytes : bytes <= safeLimit;
-            item->setEnabled(allowed);
-            item->setToolTip(allowed
-                ? (autoItem ? tr("按当前数据率与主机内存自动选择约 2 秒的安全缓存档位")
-                            : tr("当前主机允许该缓存档位"))
-                : tr("当前主机安全内存上限为 %1，此档位已禁用").arg(compactBytes(safeLimit)));
-        }
-    }
-
-    // If a previously selected manual tier is no longer safe because available
-    // memory changed, move the UI back to Auto before the next Start.
-    const quint64 currentBytes = ui->iqBufferComboBox->currentData().toULongLong();
-    if (ui->iqBufferComboBox->currentIndex() > 0 && currentBytes > safeLimit
-        && state_ == State::Idle) {
-        const QSignalBlocker blocker(ui->iqBufferComboBox);
-        ui->iqBufferComboBox->setCurrentIndex(0);
-    }
-
     RxConfig preview;
     preview.model = modelFromIndex(ui->modelComboBox->currentIndex());
     preview.sampleRateHz = static_cast<long>(
@@ -994,12 +974,56 @@ void MainWindow::refreshIqBufferOptions()
     if (modeIndex >= 0 && modeIndex < modes.size()) preview.enabled = modes[modeIndex].enabled;
     const quint64 expected = expectedIqBytesPerSecond(preview);
 
+    auto bytesForItem = [&](int index) -> quint64 {
+        if (index <= 0) return chooseAutoIqBufferBytes(expected, safeLimit);
+        const int ms = ui->iqBufferComboBox->itemData(index).toInt();
+        return requestedIqBufferBytesForSeconds(expected, ms / 1000.0);
+    };
+
+    auto* model = qobject_cast<QStandardItemModel*>(ui->iqBufferComboBox->model());
+    if (model) {
+        for (int i = 0; i < ui->iqBufferComboBox->count(); ++i) {
+            QStandardItem* item = model->item(i);
+            if (!item) continue;
+            const quint64 requested = bytesForItem(i);
+            const bool allowed = requested >= kMinIqBufferBytes
+                && requested <= safeLimit && requested <= kMaxIqBufferBytes;
+            item->setEnabled(allowed);
+            const int ms = ui->iqBufferComboBox->itemData(i).toInt();
+            if (allowed) {
+                const double actualSeconds = expected > 0
+                    ? static_cast<double>(requested) / static_cast<double>(expected) : 0.0;
+                item->setToolTip(i == 0
+                    ? tr("按当前数据率自动选择约 0.75 s 缓存，且自动缓存最多使用 2 GiB")
+                    : tr("目标 %1 s；当前配置实际约 %2 s（%3）")
+                        .arg(ms / 1000.0, 0, 'f', 2)
+                        .arg(actualSeconds, 0, 'f', 2)
+                        .arg(compactBytes(requested)));
+            } else {
+                const quint64 effectiveLimit = std::min(safeLimit, kMaxIqBufferBytes);
+                item->setToolTip(tr("该时长需要 %1；当前允许上限为 %2，此档位不可用")
+                    .arg(compactBytes(requested))
+                    .arg(compactBytes(effectiveLimit)));
+            }
+        }
+    }
+
+    // If a previously selected time window is no longer safe, return to Auto.
+    const quint64 currentRequested = bytesForItem(ui->iqBufferComboBox->currentIndex());
+    if (ui->iqBufferComboBox->currentIndex() > 0
+        && (currentRequested < kMinIqBufferBytes
+            || currentRequested > safeLimit
+            || currentRequested > kMaxIqBufferBytes)
+        && state_ == State::Idle) {
+        const QSignalBlocker blocker(ui->iqBufferComboBox);
+        ui->iqBufferComboBox->setCurrentIndex(0);
+    }
+
     const bool isAuto = ui->iqBufferComboBox->currentIndex() == 0;
-    quint64 selected = ui->iqBufferComboBox->currentData().toULongLong();
-    if (isAuto) selected = chooseAutoIqBufferBytes(expected, safeLimit);
+    const quint64 selected = bytesForItem(ui->iqBufferComboBox->currentIndex());
 
     QString status;
-    if (safeLimit < kMinIqBufferBytes) {
+    if (safeLimit < kMinIqBufferBytes || selected < kMinIqBufferBytes) {
         status = tr("可用内存 %1 · 不足以安全分配 256 MiB，IQ 保存已禁用")
             .arg(compactBytes(budget.effectiveAvailable));
     } else {
@@ -1019,7 +1043,9 @@ void MainWindow::refreshIqBufferOptions()
         const bool configurable = deviceConnected_;
         const bool available = safeLimit >= kMinIqBufferBytes;
         ui->saveIqCheckBox->setEnabled(configurable && available);
-        ui->iqBufferComboBox->setEnabled(configurable && available && ui->saveIqCheckBox->isChecked());
+        const bool storageControls = configurable && available && ui->saveIqCheckBox->isChecked();
+        ui->iqBufferComboBox->setEnabled(storageControls);
+        ui->storageModeComboBox->setEnabled(storageControls);
     }
 }
 
@@ -1082,14 +1108,15 @@ void MainWindow::setState(State state)
     state_ = state;
     const bool idle = state == State::Idle;
     const bool running = state == State::Running;
-    const bool configurable = idle && deviceConnected_;
+    const bool idleAvailable = idle && !validatorThread_;
+    const bool configurable = idleAvailable && deviceConnected_;
 
     // Model is a product capability selection. Current SDK context info prints
     // version information but does not expose a programmatic model query, so
     // lock the user's model choice for the duration of the logical connection.
-    ui->modelComboBox->setEnabled(idle && !deviceConnected_);
-    ui->connectDeviceButton->setEnabled(idle && !deviceConnected_);
-    ui->disconnectDeviceButton->setEnabled(idle && deviceConnected_);
+    ui->modelComboBox->setEnabled(idleAvailable && !deviceConnected_);
+    ui->connectDeviceButton->setEnabled(idleAvailable && !deviceConnected_);
+    ui->disconnectDeviceButton->setEnabled(idleAvailable && deviceConnected_);
 
     ui->centerFrequencySpinBox->setEnabled(configurable);
     ui->sampleRateComboBox->setEnabled(configurable);
@@ -1098,14 +1125,21 @@ void MainWindow::setState(State state)
     ui->displayChannelComboBox->setEnabled(configurable);
     ui->fftSizeComboBox->setEnabled(configurable);
     ui->captureDurationSpinBox->setEnabled(configurable);
+    ui->calibrationCheckBox->setEnabled(configurable);
     const HostMemoryBudget memBudget = detectHostMemoryBudget();
     const bool iqBufferAvailable = memBudget.safeIqBufferLimit >= kMinIqBufferBytes;
     ui->saveIqCheckBox->setEnabled(configurable && iqBufferAvailable);
     ui->iqBufferComboBox->setEnabled(configurable && ui->saveIqCheckBox->isChecked() && iqBufferAvailable);
+    ui->storageModeComboBox->setEnabled(configurable && ui->saveIqCheckBox->isChecked() && iqBufferAvailable);
     ui->filePathEdit->setEnabled(configurable && iqBufferAvailable && ui->saveIqCheckBox->isChecked());
     ui->browseButton->setEnabled(configurable && iqBufferAvailable && ui->saveIqCheckBox->isChecked());
     ui->startButton->setEnabled(configurable);
     ui->stopButton->setEnabled(running || state == State::Starting);
+    const bool validationReady = idle && !validatorThread_
+        && !lastCaptureMetadataPath_.isEmpty()
+        && QFileInfo::exists(lastCaptureMetadataPath_);
+    ui->validateDataButton->setEnabled(validationReady);
+    ui->logModeComboBox->setEnabled(idle && !validatorThread_);
 
     QString text;
     QString color;
@@ -1139,93 +1173,107 @@ void MainWindow::setState(State state)
         QStringLiteral("color:%1;font-weight:700;").arg(color));
 }
 
-void MainWindow::initializeSessionLog(const QString& iqPath)
+QString MainWindow::developerLogDirectory() const
 {
-    const QString logDirPath = logDirectoryForIqPath(iqPath);
-    QDir logDir;
-    if (!logDir.mkpath(logDirPath)) return;
+    return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("log"));
+}
+
+QString MainWindow::captureMetadataDirectory() const
+{
+    return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("capture_meta"));
+}
+
+QString MainWindow::makeCaptureMetadataPath(quint64 runId) const
+{
+    const QString dirPath = captureMetadataDirectory();
+    if (!QDir().mkpath(dirPath)) return QString();
+    return QDir(dirPath).filePath(
+        QStringLiteral("capture_run_%1_%2.json")
+            .arg(runId, 3, 10, QLatin1Char('0'))
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"))));
+}
+
+void MainWindow::initializeSessionLog()
+{
+    if (!developerMode_ || sessionLogFile_.isOpen()) return;
+    const QString logDirPath = developerLogDirectory();
+    if (!QDir().mkpath(logDirPath)) return;
 
     QDir dir(logDirPath);
     const QFileInfoList existing = dir.entryInfoList(
-        {QStringLiteral("lw_signal_capture_*.log")},
+        {QStringLiteral("lw_signal_capture_dev_*.log")},
         QDir::Files | QDir::Readable, QDir::Time);
-    // Keep the latest 50 sessions beside the IQ files. Field service can copy
-    // one capture directory and obtain both raw data and its diagnostics.
     for (int i = 50; i < existing.size(); ++i)
         QFile::remove(existing[i].absoluteFilePath());
 
-    const QString stamp = QDateTime::currentDateTime()
-        .toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
     sessionLogPath_ = dir.filePath(
-        QStringLiteral("lw_signal_capture_%1.log").arg(stamp));
+        QStringLiteral("lw_signal_capture_dev_%1.log")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"))));
     sessionLogFile_.setFileName(sessionLogPath_);
     if (!sessionLogFile_.open(QIODevice::WriteOnly | QIODevice::Text)) {
         sessionLogPath_.clear();
         return;
     }
-
-    const QByteArray header = QStringLiteral(
-        "# LuoWave LW39X0 Signal Capture V4.0\n"
-        "# Full session log: customer-visible events + [DEV] diagnostics\n"
-        "# Stored in <IQ directory>/log for capture-by-capture field analysis\n")
-        .toUtf8();
-    sessionLogFile_.write(header);
+    sessionLogFile_.write(
+        "# LuoWave LW39X0 Signal Capture V1.1.1\n"
+        "# Developer mode: full user events + [DEV] diagnostics\n"
+        "# Directory: <application>/log\n");
     sessionLogFile_.flush();
 }
 
-void MainWindow::relocateSessionLogForIqPath(const QString& iqPath)
+void MainWindow::closeSessionLog()
 {
-    const QString targetDirPath = logDirectoryForIqPath(iqPath);
-    if (targetDirPath.isEmpty()) return;
-    QDir().mkpath(targetDirPath);
-    {
-        QDir targetDir(targetDirPath);
-        const QFileInfoList existing = targetDir.entryInfoList(
-            {QStringLiteral("lw_signal_capture_*.log")},
-            QDir::Files | QDir::Readable, QDir::Time);
-        for (int i = 50; i < existing.size(); ++i)
-            QFile::remove(existing[i].absoluteFilePath());
-    }
-
-    const QFileInfo currentInfo(sessionLogPath_);
-    if (!sessionLogPath_.isEmpty()
-        && QDir::cleanPath(currentInfo.absolutePath()) == QDir::cleanPath(targetDirPath))
-        return;
-
-    const QString oldPath = sessionLogPath_;
-    QString baseName = currentInfo.fileName();
-    if (baseName.isEmpty()) {
-        baseName = QStringLiteral("lw_signal_capture_%1.log")
-            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz")));
-    }
-    const QString targetPath = QDir(targetDirPath).filePath(baseName);
-
     if (sessionLogFile_.isOpen()) {
         sessionLogFile_.flush();
         sessionLogFile_.close();
     }
+    sessionLogPath_.clear();
+}
 
-    bool moved = oldPath.isEmpty();
-    if (!oldPath.isEmpty() && QFileInfo::exists(oldPath)) {
-        moved = QFile::rename(oldPath, targetPath);
-        if (!moved) {
-            moved = QFile::copy(oldPath, targetPath);
-            if (moved) QFile::remove(oldPath);
-        }
+bool MainWindow::normalLogRelevant(const QString& text) const
+{
+    if (text.startsWith(QStringLiteral("[错误]"))
+        || text.startsWith(QStringLiteral("[警告]"))
+        || text.startsWith(QStringLiteral("[系统]"))
+        || text.startsWith(QStringLiteral("[校验]"))
+        || text.startsWith(QStringLiteral("[截图]"))) return true;
+
+    if (text.startsWith(QStringLiteral("[采集]"))) return true;
+
+    if (text.startsWith(QStringLiteral("[设备]"))) {
+        return text.contains(QStringLiteral("已选择"))
+            || text.contains(QStringLiteral("已断开"))
+            || text.contains(QStringLiteral("RF 校准"));
     }
 
-    sessionLogPath_ = targetPath;
-    sessionLogFile_.setFileName(sessionLogPath_);
-    if (!sessionLogFile_.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-        sessionLogPath_.clear();
+    if (text.startsWith(QStringLiteral("[存储]"))) {
+        return text.contains(QStringLiteral("IQ 文件："))
+            || text.contains(QStringLiteral("文件完成"))
+            || text.contains(QStringLiteral("原始 IQ 保存已启用"));
+    }
+    return false;
+}
+
+void MainWindow::setDeveloperMode(bool enabled)
+{
+    if (state_ != State::Idle || validatorThread_) {
+        const QSignalBlocker blocker(ui->logModeComboBox);
+        ui->logModeComboBox->setCurrentIndex(developerMode_ ? 1 : 0);
         return;
     }
-    if (!moved && !oldPath.isEmpty()) {
-        const QString line = QStringLiteral("[%1] %2\n")
-            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")),
-                 tr("[系统] 日志目录切换；旧日志保留于 %1").arg(oldPath));
-        sessionLogFile_.write(line.toUtf8());
-        sessionLogFile_.flush();
+    if (enabled == developerMode_) return;
+
+    if (enabled) {
+        developerMode_ = true;
+        initializeSessionLog();
+        if (sessionLogFile_.isOpen())
+            appendLog(tr("[系统] 开发者日志模式已开启 | 日志：%1").arg(sessionLogPath_));
+        else
+            appendLog(tr("[警告] 开发者日志文件创建失败；仅显示详细界面日志"));
+    } else {
+        appendLog(tr("[系统] 已切换至普通日志模式"));
+        closeSessionLog();
+        developerMode_ = false;
     }
 }
 
@@ -1237,24 +1285,24 @@ void MainWindow::writeLogLine(const QString& text, bool showInUi)
             .arg(now.toString(QStringLiteral("HH:mm:ss.zzz")), text));
     }
 
-    if (sessionLogFile_.isOpen()) {
+    if (developerMode_ && sessionLogFile_.isOpen()) {
         const QString line = QStringLiteral("[%1] %2\n")
             .arg(now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")), text);
         sessionLogFile_.write(line.toUtf8());
-        // Flush each event so the last useful lines survive an abnormal process
-        // exit. Log traffic is tiny relative to the raw-IQ stream.
         sessionLogFile_.flush();
     }
 }
 
 void MainWindow::appendLog(const QString& text)
 {
+    if (!developerMode_ && !normalLogRelevant(text)) return;
     writeLogLine(text, true);
 }
 
 void MainWindow::appendDeveloperLog(const QString& text)
 {
-    writeLogLine(QStringLiteral("[DEV] %1").arg(text), false);
+    if (!developerMode_) return;
+    writeLogLine(QStringLiteral("[DEV] %1").arg(text), true);
 }
 
 void MainWindow::updateWaterfallLevels()
@@ -1267,9 +1315,12 @@ void MainWindow::updateWaterfallLevels()
 
 void MainWindow::saveSpectrumScreenshot()
 {
-    const QString suggested = QDir::homePath() + QStringLiteral("/LW_spectrum_")
-        + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss"))
-        + QStringLiteral(".png");
+    const QString screenshotDir = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("screenshots"));
+    QDir().mkpath(screenshotDir);
+    const QString suggested = QDir(screenshotDir).filePath(
+        QStringLiteral("LW_spectrum_%1.png")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss"))));
 
     QString path = QFileDialog::getSaveFileName(
         this, tr("保存频谱截图"), suggested, tr("PNG image (*.png)"));
@@ -1294,10 +1345,21 @@ RxConfig MainWindow::currentConfig() const
     cfg.sampleRateHz = static_cast<long>(
         ui->sampleRateComboBox->currentText().toDouble() * 1.0e6 + 0.5);
     cfg.gainDb = ui->gainSpinBox->value();
+    cfg.performCalibration = ui->calibrationCheckBox->isChecked();
     cfg.fftSize = ui->fftSizeComboBox->currentText().toInt();
     cfg.captureDurationSeconds = ui->captureDurationSpinBox->value();
     cfg.saveIq = ui->saveIqCheckBox->isChecked();
-    cfg.iqFilePath = ui->filePathEdit->text().trimmed();
+    const QString iqPathText = ui->filePathEdit->text().trimmed();
+    if (iqPathText.isEmpty()) {
+        cfg.iqFilePath.clear();
+    } else {
+        cfg.iqFilePath = QFileInfo(iqPathText).isRelative()
+            ? QDir(QCoreApplication::applicationDirPath()).filePath(iqPathText)
+            : iqPathText;
+    }
+    cfg.iqStorageMode = static_cast<IqStorageMode>(
+        std::clamp(ui->storageModeComboBox->currentIndex(), 0, 2));
+    cfg.developerMode = developerMode_;
 
     const auto modes = modesFor(cfg.model);
     const int modeIndex = ui->channelModeComboBox->currentIndex();
@@ -1305,14 +1367,15 @@ RxConfig MainWindow::currentConfig() const
     cfg.displayChannel = static_cast<LwChannel>(
         ui->displayChannelComboBox->currentData().toInt());
 
-    const quint64 selectedBuffer = ui->iqBufferComboBox->currentData().toULongLong();
-    cfg.iqBufferAuto = (ui->iqBufferComboBox->currentIndex() == 0 || selectedBuffer == 0);
+    const int selectedBufferMs = ui->iqBufferComboBox->currentData().toInt();
+    cfg.iqBufferAuto = (ui->iqBufferComboBox->currentIndex() == 0 || selectedBufferMs <= 0);
     if (cfg.saveIq) {
         const HostMemoryBudget budget = detectHostMemoryBudget();
         const quint64 expected = expectedIqBytesPerSecond(cfg);
-        cfg.iqBufferBytes = static_cast<std::size_t>(cfg.iqBufferAuto
+        const quint64 bytes = cfg.iqBufferAuto
             ? chooseAutoIqBufferBytes(expected, budget.safeIqBufferLimit)
-            : selectedBuffer);
+            : requestedIqBufferBytesForSeconds(expected, selectedBufferMs / 1000.0);
+        cfg.iqBufferBytes = static_cast<std::size_t>(bytes);
     }
     return cfg;
 }
@@ -1364,6 +1427,10 @@ bool MainWindow::validateConfig(const RxConfig& cfg, QString& reason) const
         }
         if (cfg.iqBufferBytes < kMinIqBufferBytes) {
             reason = tr("IQ 写入缓存配置无效；请重新选择缓存档位");
+            return false;
+        }
+        if (static_cast<quint64>(cfg.iqBufferBytes) > kMaxIqBufferBytes) {
+            reason = tr("IQ 写入缓存超过 V1.1.1 的 4 GiB 保护上限；请缩短缓存时长");
             return false;
         }
         if (static_cast<quint64>(cfg.iqBufferBytes) > budget.safeIqBufferLimit) {
@@ -1421,20 +1488,59 @@ void MainWindow::disconnectDevice()
     setState(State::Idle);
 }
 
+void MainWindow::startDataValidation()
+{
+    if (state_ != State::Idle || validatorThread_) return;
+    if (lastCaptureMetadataPath_.isEmpty() || !QFileInfo::exists(lastCaptureMetadataPath_)) {
+        ui->validationStatusLabel->setText(tr("无可校验数据"));
+        appendLog(tr("[校验] 未找到上一次采集元数据"));
+        return;
+    }
+
+    validatorThread_ = new QThread(this);
+    validator_ = new DataValidator(lastCaptureMetadataPath_);
+    validator_->moveToThread(validatorThread_);
+    ui->validationStatusLabel->setText(tr("校验中… 0%"));
+    setState(State::Idle);
+    appendLog(tr("[校验] 开始离线校验上一次采集；采集中不会执行此功能"));
+
+    connect(validatorThread_, &QThread::started, validator_, &DataValidator::run);
+    connect(validator_, &DataValidator::progress, this, [this](int percent) {
+        ui->validationStatusLabel->setText(tr("校验中… %1%").arg(percent));
+    });
+    connect(validator_, &DataValidator::finished,
+            this, &MainWindow::finishDataValidation, Qt::QueuedConnection);
+    connect(validator_, &DataValidator::finished, validatorThread_, &QThread::quit);
+    connect(validatorThread_, &QThread::finished, validator_, &QObject::deleteLater);
+    connect(validatorThread_, &QThread::finished, this, [this] {
+        QThread* old = validatorThread_;
+        validatorThread_ = nullptr;
+        validator_ = nullptr;
+        if (old) old->deleteLater();
+        setState(state_);
+        if (closeAfterStop_) {
+            closeAfterStop_ = false;
+            QTimer::singleShot(0, this, &QWidget::close);
+        }
+    });
+    validatorThread_->start();
+}
+
+void MainWindow::finishDataValidation(bool success, const QString& summary, const QString& reportPath)
+{
+    ui->validationStatusLabel->setText(success ? summary : tr("上次采集：校验未完成"));
+    ui->validationStatusLabel->setToolTip(reportPath);
+    if (!reportPath.isEmpty()) lastValidationReportPath_ = reportPath;
+    appendLog(tr("[校验] %1").arg(summary));
+    if (!reportPath.isEmpty())
+        appendLog(tr("[校验] 报告：%1").arg(reportPath));
+}
+
 void MainWindow::startCapture()
 {
     if (state_ != State::Idle || rxThread_ || !deviceConnected_) return;
 
     RxConfig cfg = currentConfig();
-    // Keep the complete developer log beside the configured IQ file. If the
-    // user browsed to another capture directory since launch, move this session
-    // log before the run starts so data and diagnostics stay together.
-    const QString oldLogPath = sessionLogPath_;
-    relocateSessionLogForIqPath(cfg.iqFilePath);
-    if (!sessionLogPath_.isEmpty() && sessionLogPath_ != oldLogPath)
-        appendLog(tr("[系统] 运行日志：%1").arg(sessionLogPath_));
-    else if (sessionLogPath_.isEmpty())
-        appendLog(tr("[警告] 运行日志文件不可用；本次仅保留界面日志"));
     QString reason;
     if (!validateConfig(cfg, reason)) {
         appendLog(tr("[错误] 启动前检查未通过：%1").arg(reason));
@@ -1442,6 +1548,23 @@ void MainWindow::startCapture()
         return;
     }
     cfg.captureRunId = ++captureRunSequence_;
+    cfg.developerMode = developerMode_;
+    if (cfg.saveIq) {
+        cfg.captureMetadataPath = makeCaptureMetadataPath(cfg.captureRunId);
+        lastCaptureMetadataPath_ = cfg.captureMetadataPath;
+        lastValidationReportPath_.clear();
+        if (cfg.captureMetadataPath.isEmpty()) {
+            ui->validationStatusLabel->setText(tr("无可校验数据"));
+            appendLog(tr("[警告] 无法在程序目录创建 capture_meta；本次采集仍可继续，但停止后数据校验不可用"));
+        } else {
+            ui->validationStatusLabel->setText(tr("上次采集：等待完成"));
+        }
+    } else {
+        cfg.captureMetadataPath.clear();
+        lastCaptureMetadataPath_.clear();
+        lastValidationReportPath_.clear();
+        ui->validationStatusLabel->setText(tr("无可校验数据"));
+    }
 
     setState(State::Starting);
     deviceReleaseConfirmed_ = false;
@@ -1486,8 +1609,10 @@ void MainWindow::startCapture()
         ui->statusBar->showMessage(tr("● RX 已停止，正在完成剩余处理"));
     });
     connect(rxWorker_, &RxWorker::logMessage, this, &MainWindow::appendLog);
-    connect(rxWorker_, &RxWorker::diagnosticMessage,
-            this, &MainWindow::appendDeveloperLog, Qt::QueuedConnection);
+    if (developerMode_) {
+        connect(rxWorker_, &RxWorker::diagnosticMessage,
+                this, &MainWindow::appendDeveloperLog, Qt::QueuedConnection);
+    }
     connect(rxWorker_, &RxWorker::errorOccurred, this, [this, runId = cfg.captureRunId](const QString& message) {
         appendDeveloperLog(tr("[Run#%1][ERROR] %2").arg(runId, 3, 10, QLatin1Char('0')).arg(message));
         appendLog(tr("[错误] %1").arg(message));
@@ -1555,6 +1680,12 @@ void MainWindow::startCapture()
         setState(State::Idle);
         refreshIqBufferOptions();
         updateConnectionUi();
+        if (!lastCaptureMetadataPath_.isEmpty() && QFileInfo::exists(lastCaptureMetadataPath_)) {
+            ui->validationStatusLabel->setText(tr("上次采集：未校验"));
+            ui->validateDataButton->setEnabled(true);
+        } else {
+            ui->validationStatusLabel->setText(tr("无可校验数据"));
+        }
         if (closeAfterStop_) {
             closeAfterStop_ = false;
             QTimer::singleShot(0, this, &QWidget::close);
@@ -1571,13 +1702,18 @@ void MainWindow::startCapture()
     } else {
         appendLog(tr("[采集] 采集时间：连续"));
     }
-    appendDeveloperLog(tr("[Run#%1][GUI] start | display=%2 | FFT=%3 | duration=%4 s | save=%5 | path=%6")
+    appendDeveloperLog(tr("[Run#%1][GUI] start | display=%2 | FFT=%3 | duration=%4 s | save=%5 | calibration=%6 | storageMode=%7 | path=%8")
         .arg(cfg.captureRunId, 3, 10, QLatin1Char('0'))
         .arg(channelName(cfg.displayChannel))
         .arg(cfg.fftSize)
         .arg(cfg.captureDurationSeconds, 0, 'f', 3)
         .arg(cfg.saveIq ? QStringLiteral("1") : QStringLiteral("0"))
+        .arg(cfg.performCalibration ? QStringLiteral("1") : QStringLiteral("0"))
+        .arg(static_cast<int>(cfg.iqStorageMode))
         .arg(cfg.saveIq ? cfg.iqFilePath : QStringLiteral("-")));
+    appendLog(cfg.performCalibration
+        ? tr("[设备] 本次 Start 将执行已使能 Zone 的 RF 校准")
+        : tr("[设备] 本次 Start 不执行 RF 校准"));
     if (cfg.saveIq) {
         const HostMemoryBudget budget = detectHostMemoryBudget();
         const quint64 expected = expectedIqBytesPerSecond(cfg);
@@ -1654,6 +1790,13 @@ void MainWindow::onWorkerStopped()
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+    if (validatorThread_ && validatorThread_->isRunning()) {
+        closeAfterStop_ = true;
+        if (validator_) validator_->requestCancel();
+        appendDeveloperLog(tr("[APP] close requested while data validation is running"));
+        event->ignore();
+        return;
+    }
     if (rxThread_ && rxThread_->isRunning()) {
         closeAfterStop_ = true;
         appendDeveloperLog(tr("[APP] close requested while RX thread is running"));

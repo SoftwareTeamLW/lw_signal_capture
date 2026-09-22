@@ -14,6 +14,7 @@ class QScrollArea;
 class QLabel;
 class QThread;
 class RxWorker;
+class DataValidator;
 class SpectrumWidget;
 class WaterfallWidget;
 class ConstellationPlaceholderWidget;
@@ -55,8 +56,15 @@ private:
     void setState(State state);
     void appendLog(const QString& text);
     void appendDeveloperLog(const QString& text);
-    void initializeSessionLog(const QString& iqPath);
-    void relocateSessionLogForIqPath(const QString& iqPath);
+    bool normalLogRelevant(const QString& text) const;
+    void setDeveloperMode(bool enabled);
+    QString developerLogDirectory() const;
+    QString captureMetadataDirectory() const;
+    QString makeCaptureMetadataPath(quint64 runId) const;
+    void startDataValidation();
+    void finishDataValidation(bool success, const QString& summary, const QString& reportPath);
+    void initializeSessionLog();
+    void closeSessionLog();
     void writeLogLine(const QString& text, bool showInUi);
     void updateWaterfallLevels();
     void saveSpectrumScreenshot();
@@ -84,6 +92,8 @@ private:
     AppLanguage language_ = AppLanguage::Chinese;
 
     QThread* rxThread_ = nullptr;
+    QThread* validatorThread_ = nullptr;
+    DataValidator* validator_ = nullptr;
     RxWorker* rxWorker_ = nullptr;
     State state_ = State::Idle;
     bool deviceConnected_ = false;
@@ -91,6 +101,9 @@ private:
     LwModel connectedModel_ = LwModel::LW3940;
     bool closeAfterStop_ = false;
     quint64 captureRunSequence_ = 0;
+    bool developerMode_ = false;
+    QString lastCaptureMetadataPath_;
+    QString lastValidationReportPath_;
 
     QFile sessionLogFile_;
     QString sessionLogPath_;

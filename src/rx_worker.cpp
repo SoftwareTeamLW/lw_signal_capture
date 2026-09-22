@@ -3,10 +3,15 @@
 #include <lw39x0.h>
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSaveFile>
 #include <QList>
 #include <QStorageInfo>
 #include <QStringList>
@@ -37,16 +42,16 @@ constexpr qint64 kPreviewIntervalMs = 50;       // target ~20 FPS
 constexpr qint64 kStatsIntervalMs = 500;
 constexpr qint64 kIqCheckIntervalMs = 1000;
 constexpr qint64 kDeveloperStatusIntervalMs = 2000;
-constexpr qint64 kStorageStartupStatusIntervalMs = 200;
-constexpr qint64 kStorageSteadyStatusIntervalMs = 1000;
-constexpr qint64 kStorageStartupWindowMs = 3000;
+constexpr qint64 kStorageStartupStatusIntervalMs = 1000;
+constexpr qint64 kStorageSteadyStatusIntervalMs = 2000;
+constexpr qint64 kStorageStartupWindowMs = 5000;
+constexpr double kStorageProtectiveStopFillPercent = 85.0;
 constexpr std::size_t kAlignment = 32 * 1024;
 constexpr std::size_t kProbeBytes = 256;
 constexpr std::size_t kAnalysisShorts = 32768;
 constexpr std::size_t kWriterQueueMinBytes = 256ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kWriterBatchMaxBytes = 8ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kWriterDirectAlignment = 4096ULL;
-constexpr std::size_t kWriterStdioBufferBytes = 8ULL * 1024ULL * 1024ULL;
 
 struct FreeDeleter {
     void operator()(char* p) const noexcept { std::free(p); }
@@ -67,12 +72,6 @@ struct RawStats {
     {
         return count ? 100.0 * static_cast<double>(nonZero) / static_cast<double>(count) : 0.0;
     }
-};
-
-struct FileCheckResult {
-    bool opened = false;
-    qint64 fileSize = 0;
-    RawStats stats;
 };
 
 struct WriterSnapshot
@@ -253,13 +252,23 @@ QString nvmeThermalText(const NvmeThermalSnapshot& t)
 
 QString bytesText(quint64 bytes);
 
+QString storageModeText(IqStorageMode mode)
+{
+    switch (mode) {
+    case IqStorageMode::Buffered: return QStringLiteral("Buffered");
+    case IqStorageMode::Direct: return QStringLiteral("Direct");
+    default: return QStringLiteral("Auto");
+    }
+}
+
 class AsyncIqWriter final
 {
 public:
     ~AsyncIqWriter() { finish(); }
 
     bool start(const QString& path, std::size_t blockBytes,
-               std::size_t requestedCapacityBytes, QString& error)
+               std::size_t requestedCapacityBytes, IqStorageMode requestedMode,
+               QString& error)
     {
         path_ = path;
         slotSize_ = std::max<std::size_t>(1, blockBytes);
@@ -287,29 +296,43 @@ public:
                 std::chrono::steady_clock::now() - allocBegin).count());
 
         const QByteArray pathBytes = path.toLocal8Bit();
-        errno = 0;
+        requestedMode_ = requestedMode;
+        directOpenErrno_ = 0;
+
+        // V1.1 Auto intentionally prefers buffered sequential fwrite(), which
+        // is closer to the vendor recv_demo. Direct I/O is opt-in so field
+        // deployments can compare thermal behaviour without losing the V1.0
+        // continuity checks and bounded application queue.
+        if (requestedMode == IqStorageMode::Direct) {
+            errno = 0;
 #ifdef O_DIRECT
-        directFd_ = ::open(pathBytes.constData(), O_CREAT | O_WRONLY | O_TRUNC | O_DIRECT | O_CLOEXEC, 0666);
+            directFd_ = ::open(pathBytes.constData(),
+                O_CREAT | O_WRONLY | O_TRUNC | O_DIRECT | O_CLOEXEC, 0666);
 #else
-        directFd_ = -1;
-        errno = EOPNOTSUPP;
+            directFd_ = -1;
+            errno = EOPNOTSUPP;
 #endif
-        if (directFd_ >= 0) {
+            if (directFd_ < 0) {
+                directOpenErrno_ = errno;
+                ring_.reset();
+                error = QStringLiteral("Direct I/O 打开失败：%1 | errno=%2 (%3)")
+                    .arg(path).arg(directOpenErrno_)
+                    .arg(QString::fromLocal8Bit(std::strerror(directOpenErrno_)));
+                return false;
+            }
             backend_ = Backend::Direct;
         } else {
-            directOpenErrno_ = errno;
             errno = 0;
             output_ = std::fopen(pathBytes.constData(), "wb");
             if (!output_) {
                 const int e = errno;
                 ring_.reset();
-                error = QStringLiteral("IQ 文件创建失败：%1 | O_DIRECT errno=%2 | fallback errno=%3 (%4)")
-                    .arg(path).arg(directOpenErrno_).arg(e)
+                error = QStringLiteral("IQ 文件创建失败：%1 | errno=%2 (%3)")
+                    .arg(path).arg(e)
                     .arg(QString::fromLocal8Bit(std::strerror(e)));
                 return false;
             }
             backend_ = Backend::Buffered;
-            (void)std::setvbuf(output_, nullptr, _IOFBF, kWriterStdioBufferBytes);
         }
 
         stopping_ = false;
@@ -463,12 +486,27 @@ public:
             }
         } else if (output_) {
             if (!failed()) {
+                const auto flushBegin = std::chrono::steady_clock::now();
                 errno = 0;
                 if (std::fflush(output_) != 0) {
                     const int e = errno;
                     setIoError(QStringLiteral("IQ 文件最终刷新失败：errno=%1 (%2)")
                         .arg(e).arg(QString::fromLocal8Bit(std::strerror(e))));
+                } else {
+                    const int fd = ::fileno(output_);
+                    errno = 0;
+                    if (fd >= 0 && ::fdatasync(fd) != 0) {
+                        const int e = errno;
+                        setIoError(QStringLiteral("IQ 文件最终 fdatasync 失败：errno=%1 (%2)")
+                            .arg(e).arg(QString::fromLocal8Bit(std::strerror(e))));
+                    }
                 }
+                const quint64 flushUsec = static_cast<quint64>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - flushBegin).count());
+                flushCalls_.fetch_add(1, std::memory_order_acq_rel);
+                totalFlushUsec_.fetch_add(flushUsec, std::memory_order_acq_rel);
+                atomicMax(maxFlushUsec_, flushUsec);
             }
             errno = 0;
             if (std::fclose(output_) != 0 && !failed()) {
@@ -520,9 +558,11 @@ public:
     QString backendName() const
     {
         return backend_ == Backend::Direct
-            ? QStringLiteral("O_DIRECT / sync write")
-            : QStringLiteral("buffered stdio fallback");
+            ? QStringLiteral("Direct I/O / O_DIRECT")
+            : QStringLiteral("Buffered / fwrite");
     }
+
+    IqStorageMode requestedMode() const noexcept { return requestedMode_; }
 
     QString errorText() const
     {
@@ -557,19 +597,19 @@ private:
     void writerLoop()
     {
         using clock = std::chrono::steady_clock;
-        auto lastFlush = clock::now();
 
         for (;;) {
             std::size_t bytes = 0;
             std::size_t head = 0;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                // At multi-GiB/s rates, wait briefly for an 8 MiB batch so
-                // synchronous O_DIRECT behaves like the validated fio path
-                // instead of issuing one 256 KiB syscall per DMA block. Low-rate
-                // streams are still drained at least every ~10 ms.
-                cv_.wait_for(lock, std::chrono::milliseconds(10), [this] {
-                    return stopping_ || usedBytes_ >= kWriterBatchMaxBytes;
+                // Direct mode batches up to 8 MiB to reduce syscall overhead.
+                // Buffered mode deliberately drains one RX block at a time so
+                // its write pattern remains close to the vendor recv_demo.
+                const std::size_t wakeBytes = backend_ == Backend::Direct
+                    ? kWriterBatchMaxBytes : slotSize_;
+                cv_.wait_for(lock, std::chrono::milliseconds(10), [this, wakeBytes] {
+                    return stopping_ || usedBytes_ >= wakeBytes;
                 });
 
                 if (usedBytes_ == 0) {
@@ -584,7 +624,9 @@ private:
 
                 head = headByte_;
                 const std::size_t contiguous = std::min(usedBytes_, capacityBytes_ - headByte_);
-                bytes = std::min(contiguous, kWriterBatchMaxBytes);
+                const std::size_t batchLimit = backend_ == Backend::Direct
+                    ? kWriterBatchMaxBytes : slotSize_;
+                bytes = std::min(contiguous, batchLimit);
                 if (backend_ == Backend::Direct)
                     bytes = (bytes / kWriterDirectAlignment) * kWriterDirectAlignment;
                 if (bytes == 0) {
@@ -651,31 +693,11 @@ private:
                 usedBytes_ -= bytes;
             }
 
-            if (backend_ == Backend::Buffered) {
-                const auto now = clock::now();
-                if (now - lastFlush >= std::chrono::seconds(1)) {
-                    errno = 0;
-                    const auto flushBegin = clock::now();
-                    const int flushRet = std::fflush(output_);
-                    const quint64 flushUsec = static_cast<quint64>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            clock::now() - flushBegin).count());
-                    flushCalls_.fetch_add(1, std::memory_order_acq_rel);
-                    totalFlushUsec_.fetch_add(flushUsec, std::memory_order_acq_rel);
-                    atomicMax(maxFlushUsec_, flushUsec);
-                    if (flushRet != 0) {
-                        const int e = errno;
-                        setIoError(QStringLiteral("IQ 文件刷新失败：errno=%1 (%2)")
-                            .arg(e).arg(QString::fromLocal8Bit(std::strerror(e))));
-                        break;
-                    }
-                    lastFlush = now;
-                }
-            }
         }
     }
 
     Backend backend_ = Backend::None;
+    IqStorageMode requestedMode_ = IqStorageMode::Auto;
     QString path_;
     int directFd_ = -1;
     int directOpenErrno_ = 0;
@@ -990,34 +1012,6 @@ QString perChannelSummary(const char* raw, std::size_t bytes, const RxConfig& cf
     return parts.join(QStringLiteral(" | "));
 }
 
-FileCheckResult verifyIqFile(const QString& path)
-{
-    FileCheckResult result;
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) return result;
-    result.opened = true;
-    result.fileSize = file.size();
-    if (result.fileSize <= 0) return result;
-
-    constexpr qint64 chunk = 64 * 1024;
-    QByteArray sample;
-    const std::array<qint64, 3> positions = {
-        0,
-        std::max<qint64>(0, result.fileSize / 2 - chunk / 2),
-        std::max<qint64>(0, result.fileSize - chunk)
-    };
-
-    for (qint64 pos : positions) {
-        if (!file.seek(pos)) continue;
-        const QByteArray block = file.read(std::min<qint64>(chunk, result.fileSize - pos));
-        sample.append(block);
-    }
-
-    result.stats = analyzeRaw(sample.constData(), static_cast<std::size_t>(sample.size()),
-                              static_cast<std::size_t>(sample.size() / 2));
-    return result;
-}
-
 QString mibText(quint64 bytes)
 {
     return QStringLiteral("%1 MiB").arg(bytes / 1048576.0, 0, 'f', 1);
@@ -1038,6 +1032,82 @@ QString bytesText(quint64 bytes)
     if (bytes >= 1024ULL)
         return QStringLiteral("%1 KiB").arg(bytes / 1024.0, 0, 'f', 1);
     return QStringLiteral("%1 B").arg(bytes);
+}
+
+
+bool writeCaptureMetadata(const RxConfig& cfg,
+                          qint64 rxElapsedMs,
+                          quint64 recvBytes,
+                          quint64 recvCalls,
+                          quint64 partialBlocks,
+                          qint64 maxReceiveGapMs,
+                          bool validIq,
+                          bool storageStopped,
+                          bool abnormal,
+                          const QString& terminationReason,
+                          const WriterSnapshot& writer,
+                          quint64 fileBytes)
+{
+    if (!cfg.saveIq || cfg.captureMetadataPath.isEmpty()) return false;
+    const int channels = std::max(1, enabledChannelCount(cfg));
+    const quint64 expectedBps = static_cast<quint64>(std::max<long>(0, cfg.sampleRateHz))
+        * static_cast<quint64>(channels) * 4ULL;
+    const quint64 actualSamplesPerChannel = fileBytes / (static_cast<quint64>(channels) * 4ULL);
+    const long double expectedSamplesLd = static_cast<long double>(std::max<long>(0, cfg.sampleRateHz))
+        * static_cast<long double>(std::max<qint64>(0, rxElapsedMs)) / 1000.0L;
+    const quint64 expectedSamplesPerChannel = expectedSamplesLd > 0.0L
+        ? static_cast<quint64>(std::llround(expectedSamplesLd)) : 0;
+    const quint64 estimatedMissingSamples = expectedSamplesPerChannel > actualSamplesPerChannel
+        ? expectedSamplesPerChannel - actualSamplesPerChannel : 0;
+    const double coverage = expectedSamplesPerChannel > 0
+        ? 100.0 * static_cast<double>(actualSamplesPerChannel)
+          / static_cast<double>(expectedSamplesPerChannel)
+        : 0.0;
+
+    QJsonArray channelsJson;
+    for (int i = 0; i < 8; ++i)
+        if (cfg.enabled[i]) channelsJson.append(channelName(static_cast<LwChannel>(i)));
+
+    QJsonObject o;
+    o.insert(QStringLiteral("format_version"), QStringLiteral("LW_CAPTURE_META_1"));
+    o.insert(QStringLiteral("app_version"), QStringLiteral("1.1.1"));
+    o.insert(QStringLiteral("created_at"), QDateTime::currentDateTime().toString(Qt::ISODateWithMs));
+    o.insert(QStringLiteral("run_id"), static_cast<double>(cfg.captureRunId));
+    o.insert(QStringLiteral("model"), modelName(cfg.model));
+    o.insert(QStringLiteral("uri"), QString::fromLatin1(cfg.uri));
+    o.insert(QStringLiteral("center_frequency_hz"), cfg.centerFrequencyHz);
+    o.insert(QStringLiteral("sample_rate_hz"), static_cast<double>(cfg.sampleRateHz));
+    o.insert(QStringLiteral("enabled_channels"), channelsJson);
+    o.insert(QStringLiteral("enabled_channel_count"), channels);
+    o.insert(QStringLiteral("frame_bytes"), static_cast<double>(cfg.frameBytes));
+    o.insert(QStringLiteral("calibration"), cfg.performCalibration);
+    o.insert(QStringLiteral("developer_mode"), cfg.developerMode);
+    o.insert(QStringLiteral("iq_file_path"), QFileInfo(cfg.iqFilePath).absoluteFilePath());
+    o.insert(QStringLiteral("storage_mode"), storageModeText(cfg.iqStorageMode));
+    o.insert(QStringLiteral("iq_buffer_bytes"), static_cast<double>(cfg.iqBufferBytes));
+    o.insert(QStringLiteral("rx_elapsed_ms"), static_cast<double>(rxElapsedMs));
+    o.insert(QStringLiteral("expected_bytes_per_second"), static_cast<double>(expectedBps));
+    o.insert(QStringLiteral("recv_bytes"), static_cast<double>(recvBytes));
+    o.insert(QStringLiteral("recv_calls"), static_cast<double>(recvCalls));
+    o.insert(QStringLiteral("partial_blocks"), static_cast<double>(partialBlocks));
+    o.insert(QStringLiteral("max_receive_gap_ms"), static_cast<double>(maxReceiveGapMs));
+    o.insert(QStringLiteral("writer_enqueued_bytes"), static_cast<double>(writer.totalEnqueued));
+    o.insert(QStringLiteral("writer_written_bytes"), static_cast<double>(writer.totalWritten));
+    o.insert(QStringLiteral("file_bytes"), static_cast<double>(fileBytes));
+    o.insert(QStringLiteral("expected_samples_per_channel"), static_cast<double>(expectedSamplesPerChannel));
+    o.insert(QStringLiteral("file_samples_per_channel"), static_cast<double>(actualSamplesPerChannel));
+    o.insert(QStringLiteral("estimated_missing_samples_per_channel"), static_cast<double>(estimatedMissingSamples));
+    o.insert(QStringLiteral("estimated_time_coverage_percent"), coverage);
+    o.insert(QStringLiteral("valid_iq_seen"), validIq);
+    o.insert(QStringLiteral("storage_stopped_capture"), storageStopped);
+    o.insert(QStringLiteral("abnormal_termination"), abnormal);
+    o.insert(QStringLiteral("termination_reason"), terminationReason);
+
+    QDir().mkpath(QFileInfo(cfg.captureMetadataPath).absolutePath());
+    QSaveFile file(cfg.captureMetadataPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) return false;
+    file.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
+    return file.commit();
 }
 } // namespace
 
@@ -1133,6 +1203,42 @@ void RxWorker::configureDevice(lw39x0_context* ctx)
     const lw39x0_rx_channels channels = toSdkChannels(config_);
     lw39x0_enable_rx_channels(ctx, channels);
     openAndGainSelected(ctx, config_);
+
+    if (!config_.performCalibration) return;
+
+    QStringList zones;
+    if (config_.enabled[0] || config_.enabled[1]) zones << QStringLiteral("A");
+    if (config_.model != LwModel::LW3920 && (config_.enabled[2] || config_.enabled[3]))
+        zones << QStringLiteral("B");
+    if (config_.model == LwModel::LW3980 && (config_.enabled[4] || config_.enabled[5]))
+        zones << QStringLiteral("C");
+    if (config_.model == LwModel::LW3980 && (config_.enabled[6] || config_.enabled[7]))
+        zones << QStringLiteral("D");
+
+    emit logMessage(tr("[设备] RF 校准开始：Zone %1").arg(zones.join(QStringLiteral(" + "))));
+    const auto calibrateZone = [this](const QString& zone, auto fn) {
+        if (stopRequested_.load(std::memory_order_acquire)) return;
+        const auto begin = std::chrono::steady_clock::now();
+        fn();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+        emit diagnosticMessage(tr("[%1][CAL] zone=%2 completed elapsed=%3 ms")
+            .arg(runTag(config_)).arg(zone).arg(ms));
+    };
+
+    if (config_.enabled[0] || config_.enabled[1])
+        calibrateZone(QStringLiteral("A"), [&] { lw39x0_set_zone_A_calibrate(ctx, true); });
+    if (config_.model != LwModel::LW3920 && (config_.enabled[2] || config_.enabled[3]))
+        calibrateZone(QStringLiteral("B"), [&] { lw39x0_set_zone_B_calibrate(ctx, true); });
+    if (config_.model == LwModel::LW3980 && (config_.enabled[4] || config_.enabled[5]))
+        calibrateZone(QStringLiteral("C"), [&] { lw39x0_set_zone_C_calibrate(ctx, true); });
+    if (config_.model == LwModel::LW3980 && (config_.enabled[6] || config_.enabled[7]))
+        calibrateZone(QStringLiteral("D"), [&] { lw39x0_set_zone_D_calibrate(ctx, true); });
+
+    if (stopRequested_.load(std::memory_order_acquire))
+        emit logMessage(tr("[设备] RF 校准调用结束；已收到停止请求"));
+    else
+        emit logMessage(tr("[设备] RF 校准调用完成"));
 }
 
 void RxWorker::cleanup(lw39x0_context*& ctx, bool& receiveStarted) noexcept
@@ -1196,7 +1302,7 @@ void RxWorker::run()
                     .arg(config_.centerFrequencyHz / 1.0e6, 0, 'f', 3)
                     .arg(config_.sampleRateHz / 1.0e6, 0, 'f', 3)
                     .arg(config_.gainDb, 0, 'f', 1));
-    emit diagnosticMessage(tr("[%1][CONFIG] model=%2 uri=%3 channels=%4 display=%5 fc=%6 Hz fs=%7 Hz gain=%8 dB FFT=%9 frameBytes=%10 duration=%11 s save=%12")
+    emit diagnosticMessage(tr("[%1][CONFIG] model=%2 uri=%3 channels=%4 display=%5 fc=%6 Hz fs=%7 Hz gain=%8 dB calibration=%9 FFT=%10 frameBytes=%11 duration=%12 s save=%13 storageMode=%14")
         .arg(tag)
         .arg(modelName(config_.model))
         .arg(QString::fromLatin1(config_.uri))
@@ -1205,10 +1311,12 @@ void RxWorker::run()
         .arg(config_.centerFrequencyHz, 0, 'f', 0)
         .arg(config_.sampleRateHz)
         .arg(config_.gainDb, 0, 'f', 1)
+        .arg(config_.performCalibration ? 1 : 0)
         .arg(config_.fftSize)
         .arg(static_cast<qulonglong>(config_.frameBytes))
         .arg(config_.captureDurationSeconds, 0, 'f', 3)
-        .arg(config_.saveIq ? 1 : 0));
+        .arg(config_.saveIq ? 1 : 0)
+        .arg(storageModeText(config_.iqStorageMode)));
 
     void* rawPtr = nullptr;
     if (posix_memalign(&rawPtr, kAlignment, config_.frameBytes) != 0) {
@@ -1285,7 +1393,7 @@ void RxWorker::run()
 
         QString writerError;
         if (!writer.start(config_.iqFilePath, config_.frameBytes,
-                          config_.iqBufferBytes, writerError)) {
+                          config_.iqBufferBytes, config_.iqStorageMode, writerError)) {
             emit diagnosticMessage(tr("[%1][STORAGE] writer start failed: %2")
                 .arg(tag).arg(writerError));
             emit errorOccurred(writerError);
@@ -1309,17 +1417,13 @@ void RxWorker::run()
         if (writerBufferSeconds < 0.25) {
             emit logMessage(tr("[警告] 当前 IQ 缓存仅约 %1 ms；对调度/存储抖动的容忍度较低")
                 .arg(writerBufferSeconds * 1000.0, 0, 'f', 0));
-        } else if (config_.iqBufferAuto && writerBufferSeconds < 1.60) {
-            emit logMessage(tr("[警告] 受主机可用内存限制，自动缓存未达到约 2 s 目标；当前约 %1 s")
+        } else if (config_.iqBufferAuto && writerBufferSeconds < 0.50) {
+            emit logMessage(tr("[警告] 自动缓存受内存/上限约束，当前仅约 %1 s")
                 .arg(writerBufferSeconds, 0, 'f', 2));
         }
         emit logMessage(tr("[存储] 写盘模式：%1").arg(writer.backendName()));
-        if (!writer.directIo()) {
-            emit logMessage(tr("[警告] 目标路径不支持或未能启用 O_DIRECT，已回退 buffered I/O；高速连续保存能力可能明显降低"));
-            emit diagnosticMessage(tr("[%1][STORAGE] O_DIRECT fallback openErrno=%2 (%3)")
-                .arg(tag).arg(writer.directOpenErrno())
-                .arg(QString::fromLocal8Bit(std::strerror(writer.directOpenErrno()))));
-        }
+        if (config_.iqStorageMode == IqStorageMode::Auto)
+            emit logMessage(tr("[存储] Auto：优先采用 Buffered 顺序写入；保留连续性监控与缓存保护"));
         const NvmeThermalSnapshot startThermal = readNvmeThermal();
         if (startThermal.valid) {
             emit logMessage(tr("[存储] NVMe 温度：Composite %1 °C | 最高传感器 %2 °C")
@@ -1336,8 +1440,9 @@ void RxWorker::run()
         }
         const ProcIoSnapshot procIoAtStart = readProcIo();
         const MemInfoSnapshot memAtStart = readMemInfo();
-        emit diagnosticMessage(tr("[%1][STORAGE] writer started backend=%2 direct=%3 directOpenErrno=%4 capacity=%5 mode=%6 bufferWindow=%7 ms allocPrefault=%8 ms block=%9 B batchMax=%10 directAlign=%11 expected=%12 MiB/s procWriteBytes=%13 dirty=%14 writeback=%15 memAvail=%16")
+        emit diagnosticMessage(tr("[%1][STORAGE] writer started requestedMode=%2 backend=%3 direct=%4 directOpenErrno=%5 capacity=%6 bufferMode=%7 bufferWindow=%8 ms allocPrefault=%9 ms block=%10 B directBatchMax=%11 directAlign=%12 expected=%13 MiB/s procWriteBytes=%14 dirty=%15 writeback=%16 memAvail=%17")
             .arg(tag)
+            .arg(storageModeText(config_.iqStorageMode))
             .arg(writer.backendName())
             .arg(writer.directIo() ? 1 : 0)
             .arg(writer.directOpenErrno())
@@ -1420,7 +1525,8 @@ void RxWorker::run()
     timer.start();
     qint64 lastPreview = -kPreviewIntervalMs;
     qint64 lastStats = 0;
-    qint64 lastIqCheck = -kIqCheckIntervalMs;
+    const qint64 iqCheckIntervalMs = config_.developerMode ? kIqCheckIntervalMs : 5000;
+    qint64 lastIqCheck = -iqCheckIntervalMs;
     qint64 lastDeveloperStatus = -kDeveloperStatusIntervalMs;
     qint64 lastDeveloperSampleAt = 0;
     qint64 lastStorageStatus = 0;
@@ -1430,9 +1536,11 @@ void RxWorker::run()
     quint64 bytesAtLastStats = 0;
     quint64 writerBytesAtLastDeveloperSample = 0;
     quint64 writerBytesAtLastStorageSample = 0;
-    ProcIoSnapshot procIoAtLastStorageSample = readProcIo();
+    ProcIoSnapshot procIoAtLastStorageSample = config_.developerMode ? readProcIo() : ProcIoSnapshot{};
     quint64 recvCalls = 0;
     quint64 partialBlocks = 0;
+    WriterSnapshot metadataWriter;
+    quint64 metadataFileBytes = 0;
 
     const double bytesPerSecond = expectedMibps * 1048576.0;
     const double expectedBlockMs = bytesPerSecond > 0.0
@@ -1574,8 +1682,8 @@ void RxWorker::run()
                 } else {
                     terminationReason = reason;
                 }
-                const ProcIoSnapshot pio = readProcIo();
-                const MemInfoSnapshot mem = readMemInfo();
+                const ProcIoSnapshot pio = config_.developerMode ? readProcIo() : ProcIoSnapshot{};
+                const MemInfoSnapshot mem = config_.developerMode ? readMemInfo() : MemInfoSnapshot{};
                 const double avgWriteUsec = ws.writeCalls
                     ? static_cast<double>(ws.totalWriteUsec) / ws.writeCalls : 0.0;
                 emit diagnosticMessage(tr("[%1][STORAGE] enqueue failed: %2 | queued=%3/%4 (%5%) enq=%6 written=%7 rxAvg=%8 MiB/s writerAvg=%9 MiB/s writeCalls=%10 avg/maxWrite=%11/%12 us maxBatch=%13 slots maxWrite=%14 slowWrites=%15 flush=%16 maxFlush=%17 us procWchar=%18 procWriteBytes=%19 syscw=%20 dirty=%21 writeback=%22 memAvail=%23")
@@ -1617,8 +1725,8 @@ void RxWorker::run()
                 const double writerMibps = (writtenDelta / 1048576.0) / (dt / 1000.0);
                 const double rxAverageMibps = now > 0
                     ? (totalBytes / 1048576.0) / (now / 1000.0) : 0.0;
-                const ProcIoSnapshot pio = readProcIo();
-                const MemInfoSnapshot mem = readMemInfo();
+                const ProcIoSnapshot pio = config_.developerMode ? readProcIo() : ProcIoSnapshot{};
+                const MemInfoSnapshot mem = config_.developerMode ? readMemInfo() : MemInfoSnapshot{};
                 const quint64 procWriteDelta = pio.valid && procIoAtLastStorageSample.valid
                     && pio.writeBytes >= procIoAtLastStorageSample.writeBytes
                     ? pio.writeBytes - procIoAtLastStorageSample.writeBytes : 0;
@@ -1626,7 +1734,8 @@ void RxWorker::run()
                 const double avgWriteUsec = ws.writeCalls
                     ? static_cast<double>(ws.totalWriteUsec) / ws.writeCalls : 0.0;
                 const NvmeThermalSnapshot thermal = readNvmeThermal();
-                emit diagnosticMessage(tr("[%1][STORAGE_FAST] t=%2 ms queue=%3/%4 (%5%) backlog=%6 RXavg=%7 MiB/s writerDelta=%8 MiB/s procWriteDelta=%9 MiB/s calls=%10 avg/maxWrite=%11/%12 us maxBatch=%13 slots slow=%14 sync/flush=%15 maxSyncFlush=%16 us dirty=%17 writeback=%18 memAvail=%19 backend=%20 nvmeTemp=%21")
+                if (config_.developerMode)
+                    emit diagnosticMessage(tr("[%1][STORAGE_FAST] t=%2 ms queue=%3/%4 (%5%) backlog=%6 RXavg=%7 MiB/s writerDelta=%8 MiB/s procWriteDelta=%9 MiB/s calls=%10 avg/maxWrite=%11/%12 us maxBatch=%13 slots slow=%14 sync/flush=%15 maxSyncFlush=%16 us dirty=%17 writeback=%18 memAvail=%19 backend=%20 nvmeTemp=%21")
                     .arg(tag).arg(now)
                     .arg(static_cast<qulonglong>(ws.queuedSlots))
                     .arg(static_cast<qulonglong>(ws.slotCount))
@@ -1667,6 +1776,19 @@ void RxWorker::run()
                         .arg(expectedMibps, 0, 'f', 1)
                         .arg(ws.fillPercent(), 0, 'f', 0));
                 }
+                if (now >= 3000 && lowWriterConsecutive >= 2
+                    && ws.fillPercent() >= kStorageProtectiveStopFillPercent) {
+                    storageStoppedCapture = true;
+                    abnormalTermination = true;
+                    terminationReason = tr("IQ 保存吞吐不足：缓存达到保护阈值 %1%（写入约 %2 MiB/s，RX %3 MiB/s）")
+                        .arg(kStorageProtectiveStopFillPercent, 0, 'f', 0)
+                        .arg(writerMibps, 0, 'f', 1)
+                        .arg(expectedMibps, 0, 'f', 1);
+                    emit logMessage(tr("[错误] 存储持续吞吐不足，IQ 缓存达到 %1% 保护阈值；已提前停止以减少积压并保持连续数据前缀")
+                        .arg(kStorageProtectiveStopFillPercent, 0, 'f', 0));
+                    emit errorOccurred(terminationReason);
+                    break;
+                }
                 if (!storageHealthyLogged && now >= 5000
                     && writerMibps >= expectedMibps * 0.95
                     && ws.fillPercent() < 25.0) {
@@ -1699,7 +1821,7 @@ void RxWorker::run()
             lastPreview = now;
         }
 
-        if (now - lastIqCheck >= kIqCheckIntervalMs) {
+        if (now - lastIqCheck >= iqCheckIntervalMs) {
             const RawStats stats = analyzeRaw(buffer.get(), static_cast<std::size_t>(n));
             if (stats.allZero()) {
                 ++consecutiveZeroChecks;
@@ -1741,7 +1863,7 @@ void RxWorker::run()
             bytesAtLastStats = totalBytes;
         }
 
-        if (now - lastDeveloperStatus >= kDeveloperStatusIntervalMs) {
+        if (config_.developerMode && now - lastDeveloperStatus >= kDeveloperStatusIntervalMs) {
             const PreviewSnapshot ps = preview.snapshot();
             emit diagnosticMessage(tr("[%1][RX] t=%2 ms calls=%3 bytes=%4 last=%5 B partial=%6 maxGap=%7 ms preview submit/process/replace/fail=%8/%9/%10/%11")
                 .arg(tag).arg(now).arg(recvCalls)
@@ -1792,6 +1914,8 @@ void RxWorker::run()
         }
     }
 
+    const qint64 rxElapsedMs = timer.elapsed();
+
     if (stopRequested_.load(std::memory_order_acquire) && !abnormalTermination)
         terminationReason = tr("用户停止");
 
@@ -1830,6 +1954,7 @@ void RxWorker::run()
         const auto writerFinishMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - writerFinishBegin).count();
         const WriterSnapshot finalWriter = writer.snapshot();
+        metadataWriter = finalWriter;
         const quint64 totalWritten = finalWriter.totalWritten;
         const quint64 totalEnqueued = finalWriter.totalEnqueued;
 
@@ -1838,8 +1963,8 @@ void RxWorker::run()
             .arg(totalBytes >= totalEnqueued ? totalBytes - totalEnqueued : 0));
         const double finalAvgWriteUsec = finalWriter.writeCalls
             ? static_cast<double>(finalWriter.totalWriteUsec) / finalWriter.writeCalls : 0.0;
-        const ProcIoSnapshot finalProcIo = readProcIo();
-        const MemInfoSnapshot finalMem = readMemInfo();
+        const ProcIoSnapshot finalProcIo = config_.developerMode ? readProcIo() : ProcIoSnapshot{};
+        const MemInfoSnapshot finalMem = config_.developerMode ? readMemInfo() : MemInfoSnapshot{};
         const NvmeThermalSnapshot finalThermal = readNvmeThermal();
         const double activeIoMibps = finalWriter.totalWriteUsec > 0
             ? (finalWriter.totalWritten / 1048576.0)
@@ -1890,49 +2015,40 @@ void RxWorker::run()
                 .arg(totalEnqueued > totalWritten ? totalEnqueued - totalWritten : 0));
         }
 
-        const FileCheckResult fileCheck = verifyIqFile(config_.iqFilePath);
-        if (!fileCheck.opened) {
-            emit logMessage(tr("[错误] IQ 文件校验失败：无法读取文件"));
-            emit diagnosticMessage(tr("[%1][STORAGE] verify open failed path=%2")
-                .arg(tag).arg(config_.iqFilePath));
-        } else if (fileCheck.fileSize <= 0) {
+        const QFileInfo finalFileInfo(config_.iqFilePath);
+        metadataFileBytes = finalFileInfo.exists()
+            ? static_cast<quint64>(std::max<qint64>(0, finalFileInfo.size())) : 0;
+        if (!finalFileInfo.exists()) {
+            emit logMessage(tr("[错误] IQ 文件不存在：%1").arg(config_.iqFilePath));
+        } else if (metadataFileBytes == 0) {
             emit logMessage(tr("[错误] IQ 文件为空"));
-            emit diagnosticMessage(tr("[%1][STORAGE] verify size=0 path=%2")
-                .arg(tag).arg(config_.iqFilePath));
+        } else if (metadataFileBytes != totalWritten) {
+            emit logMessage(tr("[警告] IQ 文件大小异常：写入 %1，文件 %2")
+                .arg(mibText(totalWritten)).arg(mibText(metadataFileBytes)));
         } else {
-            const quint64 diskBytes = static_cast<quint64>(fileCheck.fileSize);
-            if (diskBytes != totalWritten) {
-                emit logMessage(tr("[警告] IQ 文件大小异常：写入 %1，文件 %2")
-                                .arg(mibText(totalWritten))
-                                .arg(mibText(diskBytes)));
-            } else {
-                emit logMessage(tr("[存储] 文件完成：%1").arg(mibText(diskBytes)));
-            }
-
-            const quint64 sampleGroupBytes = static_cast<quint64>(
-                std::max(1, enabledChannelCount(config_)) * 4);
-            emit diagnosticMessage(tr("[%1][STORAGE] verify file=%2 disk=%3 written=%4 groupBytes=%5 remainder=%6 stats={%7}")
-                .arg(tag).arg(config_.iqFilePath)
-                .arg(bytesText(diskBytes)).arg(bytesText(totalWritten))
-                .arg(sampleGroupBytes).arg(diskBytes % sampleGroupBytes)
-                .arg(statsText(fileCheck.stats)));
-
-            if (diskBytes % sampleGroupBytes != 0) {
-                emit logMessage(tr("[警告] IQ 文件长度未按通道采样组对齐：余 %1 B")
-                    .arg(diskBytes % sampleGroupBytes));
-            }
-
-            if (fileCheck.stats.allZero()) {
-                emit logMessage(tr("[警告] IQ 文件内容全零"));
-            } else if (fileCheck.stats.active()) {
-                emit logMessage(tr("[存储] IQ 文件校验通过：%1").arg(statsText(fileCheck.stats)));
-            } else {
-                emit logMessage(tr("[警告] IQ 文件数据变化异常：%1").arg(statsText(fileCheck.stats)));
-            }
+            emit logMessage(tr("[存储] 文件完成：%1").arg(mibText(metadataFileBytes)));
         }
 
+        const quint64 sampleGroupBytes = static_cast<quint64>(
+            std::max(1, enabledChannelCount(config_)) * 4);
+        if (sampleGroupBytes > 0 && metadataFileBytes % sampleGroupBytes != 0) {
+            emit logMessage(tr("[警告] IQ 文件长度未按通道采样组对齐：余 %1 B")
+                .arg(metadataFileBytes % sampleGroupBytes));
+        }
+        // V1.1.1 no longer performs the old 192 KiB content spot-check here.
+        // Full-file readability/content validation is user-triggered after RX
+        // has stopped, so it never competes with acquisition or writer drain.
         if (storageStoppedCapture) {
             emit logMessage(tr("[存储] 已保留连续数据前缀；未继续写入不连续数据"));
+        }
+    }
+
+    if (config_.saveIq && !config_.captureMetadataPath.isEmpty()) {
+        if (!writeCaptureMetadata(config_, rxElapsedMs, totalBytes, recvCalls, partialBlocks,
+                                  maxReceiveGapMs, everValidIq, storageStoppedCapture,
+                                  abnormalTermination, terminationReason, metadataWriter,
+                                  metadataFileBytes)) {
+            emit logMessage(tr("[警告] 采集元数据保存失败：%1").arg(config_.captureMetadataPath));
         }
     }
 

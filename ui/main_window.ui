@@ -327,21 +327,29 @@ QToolTip { background:#2D383C; color:#F0F4F5; border:1px solid #708289; }
              </widget></item>
             </layout>
            </item>
+           <item><widget class="QCheckBox" name="calibrationCheckBox"><property name="text"><string>本次执行 RF 校准</string></property><property name="toolTip"><string>仅在本次 Start 前对已使能 Zone 执行校准。校准可能耗时较长；不需要时保持关闭。</string></property></widget></item>
            <item><widget class="QCheckBox" name="saveIqCheckBox"><property name="text"><string>保存原始 IQ</string></property><property name="toolTip"><string>勾选后保存连续原始复数 int16 IQ；采集中保持勾选状态以明确显示保存已启用。</string></property></widget></item>
+           <item>
+            <layout class="QHBoxLayout" name="storageModeLayout">
+             <property name="spacing"><number>6</number></property>
+             <item><widget class="QLabel" name="storageModeLabel"><property name="text"><string>写盘模式</string></property></widget></item>
+             <item><widget class="QComboBox" name="storageModeComboBox"><property name="toolTip"><string>自动模式优先使用与官方 recv_demo 更接近的 buffered 顺序写入；Direct I/O 仅建议在已验证磁盘上使用。</string></property>
+              <item><property name="text"><string>自动（推荐）</string></property></item>
+              <item><property name="text"><string>Buffered</string></property></item>
+              <item><property name="text"><string>Direct I/O</string></property></item>
+             </widget></item>
+            </layout>
+           </item>
            <item>
             <layout class="QHBoxLayout" name="iqBufferLayout">
              <property name="spacing"><number>6</number></property>
-             <item><widget class="QLabel" name="iqBufferLabel"><property name="text"><string>IQ 写入缓存</string></property></widget></item>
-             <item><widget class="QComboBox" name="iqBufferComboBox"><property name="toolTip"><string>用于吸收存储抖动的应用层 RAM 缓存。自动模式按当前数据率和主机可用内存选择约 2 秒的安全档位。</string></property>
+             <item><widget class="QLabel" name="iqBufferLabel"><property name="text"><string>IQ 缓冲时长</string></property></widget></item>
+             <item><widget class="QComboBox" name="iqBufferComboBox"><property name="toolTip"><string>用于吸收短时存储抖动的应用层 RAM 缓存。按时间选择，实际字节数由当前通道数和采样率计算。</string></property>
               <item><property name="text"><string>自动（推荐）</string></property></item>
-              <item><property name="text"><string>256 MiB</string></property></item>
-              <item><property name="text"><string>512 MiB</string></property></item>
-              <item><property name="text"><string>1 GiB</string></property></item>
-              <item><property name="text"><string>2 GiB</string></property></item>
-              <item><property name="text"><string>4 GiB</string></property></item>
-              <item><property name="text"><string>8 GiB</string></property></item>
-              <item><property name="text"><string>12 GiB</string></property></item>
-              <item><property name="text"><string>16 GiB</string></property></item>
+              <item><property name="text"><string>0.25 s</string></property></item>
+              <item><property name="text"><string>0.50 s</string></property></item>
+              <item><property name="text"><string>1.00 s</string></property></item>
+              <item><property name="text"><string>2.00 s</string></property></item>
              </widget></item>
             </layout>
            </item>
@@ -357,6 +365,13 @@ QToolTip { background:#2D383C; color:#F0F4F5; border:1px solid #708289; }
              <property name="spacing"><number>7</number></property>
              <item><widget class="QPushButton" name="startButton"><property name="enabled"><bool>false</bool></property><property name="text"><string>Start</string></property></widget></item>
              <item><widget class="QPushButton" name="stopButton"><property name="enabled"><bool>false</bool></property><property name="text"><string>Stop</string></property></widget></item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="validationLayout">
+             <property name="spacing"><number>7</number></property>
+             <item><widget class="QPushButton" name="validateDataButton"><property name="enabled"><bool>false</bool></property><property name="text"><string>数据校验</string></property><property name="toolTip"><string>停止采集后，对上一次保存的 IQ 文件进行离线校验。采集中不可用。</string></property></widget></item>
+             <item><widget class="QLabel" name="validationStatusLabel"><property name="text"><string>无可校验数据</string></property><property name="wordWrap"><bool>true</bool></property><property name="styleSheet"><string notr="true">color:#AAB8BC;font-size:9pt;</string></property></widget></item>
             </layout>
            </item>
           </layout>
@@ -480,7 +495,17 @@ QToolTip { background:#2D383C; color:#F0F4F5; border:1px solid #708289; }
         <item>
          <widget class="QGroupBox" name="logGroupBox">
           <property name="title"><string>运行日志</string></property>
-          <layout class="QVBoxLayout" name="logLayout"><property name="leftMargin"><number>7</number></property><property name="topMargin"><number>7</number></property><property name="rightMargin"><number>7</number></property><property name="bottomMargin"><number>7</number></property><item><widget class="QPlainTextEdit" name="logEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumBlockCount"><number>800</number></property></widget></item></layout>
+          <layout class="QVBoxLayout" name="logLayout">
+           <property name="leftMargin"><number>7</number></property><property name="topMargin"><number>7</number></property><property name="rightMargin"><number>7</number></property><property name="bottomMargin"><number>7</number></property>
+           <item>
+            <layout class="QHBoxLayout" name="logModeLayout">
+             <property name="spacing"><number>6</number></property>
+             <item><widget class="QLabel" name="logModeLabel"><property name="text"><string>日志模式</string></property></widget></item>
+             <item><widget class="QComboBox" name="logModeComboBox"><property name="toolTip"><string>普通模式仅显示关键事件且不保存日志文件；开发者模式显示并保存完整诊断信息。</string></property><item><property name="text"><string>普通</string></property></item><item><property name="text"><string>开发者</string></property></item></widget></item>
+            </layout>
+           </item>
+           <item><widget class="QPlainTextEdit" name="logEdit"><property name="readOnly"><bool>true</bool></property><property name="maximumBlockCount"><number>800</number></property></widget></item>
+          </layout>
          </widget>
         </item>
        </layout>

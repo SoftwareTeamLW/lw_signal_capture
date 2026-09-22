@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(lw_signal_capture VERSION 4.0 LANGUAGES CXX)
+project(lw_signal_capture VERSION 1.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +44,8 @@ add_executable(lw_signal_capture
     include/rx_config.hpp
     include/rx_worker.hpp
     src/rx_worker.cpp
+    include/data_validator.hpp
+    src/data_validator.cpp
     include/signal_processor.hpp
     src/signal_processor.cpp
     include/plot_widgets.hpp

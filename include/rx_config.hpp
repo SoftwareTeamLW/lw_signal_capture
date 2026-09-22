@@ -9,6 +9,11 @@
 enum class LwModel { LW3920, LW3940, LW3980 };
 enum class LwChannel { A1 = 0, A2, B1, B2, C1, C2, D1, D2 };
 
+// Storage backend selection. Auto deliberately prefers buffered sequential I/O
+// because the vendor recv_demo uses fwrite() and field testing showed gentler
+// SSD thermal behaviour. Direct I/O remains available for validated hosts.
+enum class IqStorageMode { Auto = 0, Buffered = 1, Direct = 2 };
+
 struct RxConfig
 {
     LwModel model = LwModel::LW3940;
@@ -16,6 +21,10 @@ struct RxConfig
     double centerFrequencyHz = 1.0e9;
     long sampleRateHz = 61'440'000;
     double gainDb = 20.0;
+
+    // Optional per-run RF zone calibration. When false, Start configures the
+    // device without invoking the comparatively slow calibration APIs.
+    bool performCalibration = false;
 
     std::array<bool, 8> enabled{};
     // Spectrum always displays every enabled channel. This selection is used
@@ -31,6 +40,7 @@ struct RxConfig
 
     bool saveIq = false;
     QString iqFilePath;
+    IqStorageMode iqStorageMode = IqStorageMode::Auto;
 
     // IQ writer RAM queue. MainWindow resolves Auto to a concrete safe size
     // immediately before Start. The worker never guesses a larger value.
@@ -40,6 +50,14 @@ struct RxConfig
     // Assigned by MainWindow for logging only. It never changes hardware
     // configuration and helps correlate repeated Start/Stop cycles in one log.
     quint64 captureRunId = 0;
+
+    // V1.1.1: detailed diagnostics are opt-in. Normal mode avoids periodic
+    // developer-only proc/mem/NVMe diagnostic sampling in the RX worker.
+    bool developerMode = false;
+
+    // Per-capture metadata is kept beside the executable under capture_meta/.
+    // The raw IQ path remains unchanged and may still be user-selected.
+    QString captureMetadataPath;
 };
 
 inline QString modelName(LwModel model)

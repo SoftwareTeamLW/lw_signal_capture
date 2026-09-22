@@ -10,7 +10,7 @@ int main(int argc, char* argv[])
     QApplication app(argc, argv);
     QApplication::setApplicationName("LW Signal Capture");
     QApplication::setOrganizationName("LuoWave");
-    QApplication::setApplicationVersion("4.0");
+    QApplication::setApplicationVersion("1.1");
 
     // Fusion + an explicit dark palette also styles Linux popup windows that
     // are not always covered by a parent widget's stylesheet.
